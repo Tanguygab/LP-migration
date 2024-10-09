@@ -26,21 +26,22 @@
 package me.lucko.luckperms.migration;
 
 import net.luckperms.api.LuckPerms;
-import net.luckperms.api.context.DefaultContextKeys;
 import net.luckperms.api.model.group.Group;
 import net.luckperms.api.model.user.User;
-import net.luckperms.api.node.types.InheritanceNode;
+import net.luckperms.api.node.types.*;
 
-import nl.svenar.PowerRanks.Cache.CachedPlayers;
-import nl.svenar.PowerRanks.Data.Users;
-import nl.svenar.PowerRanks.PowerRanks;
-import nl.svenar.PowerRanks.api.PowerRanksAPI;
+import nl.svenar.powerranks.bukkit.data.Users;
+import nl.svenar.powerranks.bukkit.PowerRanks;
+import nl.svenar.powerranks.api.PowerRanksAPI;
 
+import nl.svenar.powerranks.common.structure.PRPermission;
+import nl.svenar.powerranks.common.structure.PRPlayer;
+import nl.svenar.powerranks.common.structure.PRPlayerRank;
+import nl.svenar.powerranks.common.structure.PRRank;
 import org.bukkit.command.CommandSender;
-import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.util.Set;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -58,25 +59,29 @@ public final class MigrationPowerRanks extends MigrationJavaPlugin {
     public void runMigration(CommandSender sender, String[] args) {
         log(sender, "Starting.");
 
-        PowerRanksAPI prApi = pr.loadAPI();
+        PowerRanksAPI prApi = PowerRanks.getAPI();
         Users prUsers = new Users(pr);
 
         // Migrate all groups
         log(sender, "Starting groups migration.");
-        Set<String> ranks = prApi.getRanks();
+        List<PRRank> ranks = prApi.getRanksAPI().getRanks();
         AtomicInteger groupCount = new AtomicInteger(0);
-        for (String rank : ranks) {
-            Group group = this.luckPerms.getGroupManager().createAndLoadGroup(rank).join();
+        for (PRRank rank : ranks) {
+            Group group = this.luckPerms.getGroupManager().createAndLoadGroup(rank.getName()).join();
 
-            for (String node : prApi.getPermissions(rank)) {
-                if (node.isEmpty()) continue;
-                group.data().add(MigrationUtils.parseNode(node, true).build());
+            for (PRPermission node : prApi.getRanksAPI().getPermissions(rank)) {
+                if (node.getName().isEmpty()) continue;
+                group.data().add(MigrationUtils.parseNode(node.getName(), node.getValue()).build());
             }
 
-            for (String parent : prApi.getInheritances(rank)) {
-                if (parent.isEmpty()) continue;
-                group.data().add(InheritanceNode.builder(MigrationUtils.standardizeName(parent)).build());
+            for (PRRank parent : prApi.getRanksAPI().getInheritances(rank)) {
+                if (parent.getName().isEmpty()) continue;
+                group.data().add(InheritanceNode.builder(MigrationUtils.standardizeName(parent.getName())).build());
             }
+
+            group.data().add(WeightNode.builder().weight(rank.getWeight()).build());
+            group.data().add(PrefixNode.builder().prefix(rank.getPrefix()).priority(rank.getWeight()).build());
+            group.data().add(SuffixNode.builder().suffix(rank.getSuffix()).priority(rank.getWeight()).build());
 
             this.luckPerms.getGroupManager().saveGroup(group);
             log(sender, "Migrated " + groupCount.incrementAndGet() + " groups so far.");
@@ -85,37 +90,34 @@ public final class MigrationPowerRanks extends MigrationJavaPlugin {
 
         // Migrate all users
         log(sender, "Starting user migration.");
-        Set<String> playerUuids = prUsers.getCachedPlayers();
+        List<PRPlayer> players = prUsers.getCachedPlayers();
         AtomicInteger userCount = new AtomicInteger(0);
-        for (String uuidString : playerUuids) {
-            UUID uuid = lookupUuid(uuidString);
-            if (uuid == null) {
-                continue;
-            }
+        for (PRPlayer player : players) {
+            UUID uuid = player.getUUID();
+            if (uuid == null) continue;
 
             User user = this.luckPerms.getUserManager().loadUser(uuid, null).join();
 
-            user.data().add(InheritanceNode.builder(CachedPlayers.getString("players." + uuidString + ".rank")).build());
+            for (PRPlayerRank rank : player.getRanks()) {
+                if (rank.getName().isEmpty()) continue;
+                InheritanceNode.Builder builder = InheritanceNode.builder(MigrationUtils.standardizeName(rank.getName()));
 
-            final ConfigurationSection subGroups = CachedPlayers.getConfigurationSection("players." + uuidString + ".subranks");
-            if (subGroups != null) {
-                for (String subGroup : subGroups.getKeys(false)) {
-                    InheritanceNode.Builder builder = InheritanceNode.builder(subGroup);
-                    for (String worldName : CachedPlayers.getStringList("players." + uuidString + ".subranks." + subGroup + ".worlds")) {
-                        if (!worldName.equalsIgnoreCase("all")) {
-                            builder.withContext(DefaultContextKeys.WORLD_KEY, worldName);
-                        }
-                    }
-                    user.data().add(builder.build());
+                for (String tag : rank.getTags().keySet()) { // I'm assuming those are contexts, right? There's no documentation about these "tags"
+                    if (tag.equalsIgnoreCase("all")) continue;
+                    builder.withContext(tag, String.valueOf(rank.getTags().get(tag)));
                 }
+
+                user.data().add(builder.build());
             }
 
-            for (String node : CachedPlayers.getStringList("players." + uuidString + ".permissions")) {
-                if (node.isEmpty()) continue;
-                user.data().add(MigrationUtils.parseNode(node, true).build());
+            for (String tag : player.getUsertags()) {
+                user.data().add(MetaNode.builder().key(tag).value(prUsers.getUserTagValue(tag)).build());
             }
 
-            user.setPrimaryGroup(CachedPlayers.getString("players." + uuidString + ".rank"));
+            for (PRPermission permission : player.getPermissions()) {
+                if (permission.getName().isEmpty()) continue;
+                user.data().add(MigrationUtils.parseNode(permission.getName(), permission.getValue()).build());
+            }
 
             this.luckPerms.getUserManager().cleanupUser(user);
             this.luckPerms.getUserManager().saveUser(user);
@@ -128,22 +130,6 @@ public final class MigrationPowerRanks extends MigrationJavaPlugin {
         log(sender, "Success! Migration complete.");
         log(sender, "Don't forget to remove the PowerRanks jar from your plugins folder & restart the server. " +
                 "LuckPerms may not take over as the server permission handler until this is done.");
-    }
-
-    public UUID lookupUuid(String s) {
-        UUID uuid = Uuids.parse(s);
-        if (uuid == null) {
-            try {
-                //noinspection deprecation
-                uuid = getServer().getOfflinePlayer(s).getUniqueId();
-            } catch (Exception ex) {
-                ex.printStackTrace();
-            }
-        }
-        if (uuid == null) {
-            getLogger().warning("Unable to get a UUID for user identifier: " + s);
-        }
-        return uuid;
     }
 
 }
